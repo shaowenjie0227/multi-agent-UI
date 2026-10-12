@@ -1,0 +1,352 @@
+"""FastAPI 入口：配置管理 REST + 运行控制 REST + WebSocket 事件推送。"""
+from __future__ import annotations
+
+import asyncio
+from contextlib import asynccontextmanager
+
+import httpx
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+
+from .clash import (
+    extract_groups,
+    fetch_url,
+    get_all_proxies,
+    group_candidates,
+    parse_subscription,
+    select_node,
+    test_delays,
+)
+from .engine.bus import EventBus, Run
+from .engine.orchestrator import run_flow
+from .schemas import (
+    Agent,
+    AgentIn,
+    AgentUpdate,
+    ClashDelayIn,
+    ClashSelectIn,
+    ModelIn,
+    Provider,
+    ProviderIn,
+    ProviderModel,
+    ProviderUpdate,
+    RecommendIn,
+    RunEvent,
+    RunInputIn,
+    RunMeta,
+    RunStartIn,
+    SettingsUpdate,
+    SubscriptionIn,
+)
+from .selector import load_knowledge, recommend
+from .store import Store, load_run_events, load_run_metas, new_id, now
+
+store = Store()
+bus = EventBus()
+RUNS: dict[str, Run] = {}
+TASKS: dict[str, asyncio.Task] = {}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+
+
+app = FastAPI(title="Multi-Agent Studio", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ---------------- 供应商 / 模型 ----------------
+
+
+@app.get("/api/providers")
+def get_providers():
+    return {"providers": store.providers, "models": store.models}
+
+
+@app.post("/api/providers")
+def create_provider(body: ProviderIn):
+    p = Provider(id=new_id("p_"), **body.model_dump())
+    return store.add_provider(p)
+
+
+@app.put("/api/providers/{pid}")
+def update_provider(pid: str, body: ProviderUpdate):
+    p = store.update_provider(pid, body.model_dump(exclude_unset=True))
+    if not p:
+        raise HTTPException(404, "供应商不存在")
+    return p
+
+
+@app.delete("/api/providers/{pid}")
+def delete_provider(pid: str):
+    if not store.delete_provider(pid):
+        raise HTTPException(404, "供应商不存在")
+    return {"ok": True}
+
+
+@app.post("/api/providers/{pid}/models")
+def create_model(pid: str, body: ModelIn):
+    if not store.find_provider(pid):
+        raise HTTPException(404, "供应商不存在")
+    if not body.name.strip():
+        raise HTTPException(400, "模型名不能为空")
+    m = ProviderModel(id=new_id("m_"), providerId=pid, name=body.name.strip(), note=body.note)
+    return store.add_model(m)
+
+
+@app.delete("/api/providers/{pid}/models/{mid}")
+def delete_model(pid: str, mid: str):
+    if not store.delete_model(mid):
+        raise HTTPException(404, "模型不存在")
+    return {"ok": True}
+
+
+@app.get("/api/providers/{pid}/fetch-models")
+async def fetch_models(pid: str):
+    """调用供应商的 OpenAI 兼容 /models 接口拉取可用模型名列表。"""
+    p = store.find_provider(pid)
+    if not p:
+        raise HTTPException(404, "供应商不存在")
+    if not p.baseUrl:
+        raise HTTPException(400, "请先填写该供应商的 Base URL")
+    url = p.baseUrl.rstrip("/") + "/models"
+    headers = {"Authorization": f"Bearer {p.apiKey}"} if p.apiKey else {}
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(url, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+    except Exception as e:
+        raise HTTPException(502, f"拉取模型列表失败：{e}")
+    items = data.get("data", []) if isinstance(data, dict) else data
+    ids = []
+    for it in items:
+        mid = it.get("id") if isinstance(it, dict) else str(it)
+        if mid:
+            ids.append(mid)
+    return {"models": ids}
+
+
+# ---------------- 模型推荐 ----------------
+
+
+@app.post("/api/recommend-model")
+async def recommend_model(body: RecommendIn):
+    if not body.task.strip():
+        raise HTTPException(400, "任务描述不能为空")
+    try:
+        return await recommend(
+            store,
+            body.task.strip(),
+            {"cost": body.prefer.cost, "speed": body.prefer.speed},
+        )
+    except ValueError as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/selector/models")
+def selector_models():
+    return {"models": load_knowledge()}
+
+
+# ---------------- 全局设置（代理 / Clash 集成） ----------------
+
+
+@app.get("/api/settings")
+def get_settings():
+    return store.settings
+
+
+@app.put("/api/settings")
+def put_settings(body: SettingsUpdate):
+    s = store.update_settings(
+        proxy=body.proxy.model_dump() if body.proxy else None,
+        clash=body.clash.model_dump() if body.clash else None,
+    )
+    return s
+
+
+@app.post("/api/clash/subscription")
+async def clash_subscription(body: SubscriptionIn):
+    if not body.url.strip():
+        raise HTTPException(400, "订阅地址不能为空")
+    try:
+        content = await fetch_url(body.url.strip(), store.settings.proxy)
+    except Exception as e:
+        raise HTTPException(502, f"拉取订阅失败：{e}")
+    nodes = parse_subscription(content)
+    if not nodes:
+        raise HTTPException(422, "未能从订阅内容解析出节点（支持 Clash YAML 与 Base64 分享链接）")
+    return {"nodes": nodes}
+
+
+@app.get("/api/clash/groups")
+async def clash_groups():
+    try:
+        proxies = await get_all_proxies(store.settings.clash)
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
+    return {"groups": extract_groups(proxies)}
+
+
+@app.post("/api/clash/delay")
+async def clash_delay(body: ClashDelayIn):
+    clash = store.settings.clash
+    names = body.names
+    if not names:
+        try:
+            proxies = await get_all_proxies(clash)
+        except RuntimeError as e:
+            raise HTTPException(502, str(e))
+        groups = extract_groups(proxies)
+        names = group_candidates(groups[0], proxies) if groups else []
+    results = await test_delays(clash, names)
+    return {"results": results}
+
+
+@app.post("/api/clash/select")
+async def clash_select(body: ClashSelectIn):
+    try:
+        await select_node(store.settings.clash, body.group, body.name)
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
+    return {"ok": True}
+
+
+@app.post("/api/clash/auto-select")
+async def clash_auto_select(body: ClashSelectIn):
+    """测速分组内全部节点 → 切换到延迟最低的可用节点。"""
+    clash = store.settings.clash
+    try:
+        proxies = await get_all_proxies(clash)
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
+    groups = {g["name"]: g for g in extract_groups(proxies)}
+    g = groups.get(body.group)
+    if not g:
+        raise HTTPException(404, f"策略组「{body.group}」不存在")
+    candidates = group_candidates(g, proxies)
+    if not candidates:
+        raise HTTPException(422, f"策略组「{body.group}」中没有可测速的节点")
+    results = await test_delays(clash, candidates)
+    ok = [r for r in results if r["delayMs"] is not None]
+    if not ok:
+        raise HTTPException(504, "所有节点测速均超时或失败，请检查节点可用性")
+    best = min(ok, key=lambda r: r["delayMs"])
+    try:
+        await select_node(clash, body.group, best["name"])
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
+    return {"selected": best["name"], "delayMs": best["delayMs"], "results": sorted(results, key=lambda r: r["delayMs"] is None and 10**9 or r["delayMs"])}
+
+
+# ---------------- Agent ----------------
+
+
+@app.get("/api/agents")
+def get_agents():
+    return {"agents": store.agents}
+
+
+@app.post("/api/agents")
+def create_agent(body: AgentIn):
+    a = Agent(id=new_id("a_"), **body.model_dump())
+    return store.add_agent(a)
+
+
+@app.put("/api/agents/{aid}")
+def update_agent(aid: str, body: AgentUpdate):
+    a = store.update_agent(aid, body.model_dump(exclude_unset=True))
+    if not a:
+        raise HTTPException(404, "Agent 不存在")
+    return a
+
+
+@app.delete("/api/agents/{aid}")
+def delete_agent(aid: str):
+    if not store.delete_agent(aid):
+        raise HTTPException(404, "Agent 不存在")
+    return {"ok": True}
+
+
+# ---------------- 运行 ----------------
+
+
+def _active_run() -> Run | None:
+    return next((r for r in RUNS.values() if r.meta.status == "running"), None)
+
+
+@app.post("/api/runs")
+async def start_run(body: RunStartIn):
+    if not body.task.strip():
+        raise HTTPException(400, "任务内容不能为空")
+    if _active_run():
+        raise HTTPException(409, "已有进行中的运行，请先等待完成或手动停止")
+    run = Run(new_id("r_"), body.task.strip(), store, bus, agent_count=body.agentCount)
+    RUNS[run.id] = run
+    TASKS[run.id] = asyncio.create_task(run_flow(run))
+    return run.meta
+
+
+@app.get("/api/runs")
+def list_runs():
+    metas: dict[str, RunMeta] = {m.id: m for m in load_run_metas()}
+    for r in RUNS.values():
+        metas[r.id] = r.meta
+    return sorted(metas.values(), key=lambda m: m.createdAt, reverse=True)
+
+
+@app.get("/api/runs/{rid}")
+def get_run(rid: str):
+    r = RUNS.get(rid)
+    if r:
+        return {"meta": r.meta, "events": r.events}
+    events = load_run_events(rid)
+    if events is None:
+        raise HTTPException(404, "运行不存在")
+    meta = next((m for m in load_run_metas() if m.id == rid), None)
+    return {"meta": meta, "events": events}
+
+
+@app.post("/api/runs/{rid}/input")
+def run_input(rid: str, body: RunInputIn):
+    r = RUNS.get(rid)
+    if not r or r.meta.status != "running":
+        raise HTTPException(400, "运行不在进行中")
+    r.provide_input(body.text, body.kind, body.assignments)
+    return {"ok": True}
+
+
+@app.post("/api/runs/{rid}/stop")
+def stop_run(rid: str):
+    t = TASKS.get(rid)
+    if not t or t.done():
+        raise HTTPException(400, "运行已结束")
+    t.cancel()
+    return {"ok": True}
+
+
+# ---------------- WebSocket ----------------
+
+
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    await ws.accept()
+    q = bus.subscribe()
+    try:
+        await ws.send_json({"type": "hello"})
+        while True:
+            data = await q.get()
+            await ws.send_json({"type": "event", "event": data})
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        bus.unsubscribe(q)

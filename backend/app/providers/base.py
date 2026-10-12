@@ -1,0 +1,56 @@
+"""LLM 调用入口：根据 Agent 的 binding 分发到 mock 或 OpenAI 兼容实现。"""
+from __future__ import annotations
+
+from typing import Any, Awaitable, Callable, Optional
+
+from ..schemas import Agent
+from .mock import mock_chat
+from .openai_compat import real_chat
+
+
+async def chat(
+    store,
+    agent: Agent,
+    system: str,
+    messages: list[dict],
+    hint: dict[str, Any] | None = None,
+    binding: str | None = None,
+    on_delta: Optional[Callable[[str], Awaitable[None]]] = None,
+) -> str:
+    """store: app.store.Store；messages: [{"role","content"}]；hint 仅供 mock 脚本使用；
+    binding 可覆盖 Agent 自身绑定（任务分配时用户可为单个工作包指定模型）；
+    on_delta 提供时流式回调增量文本（监控实时输出用）。"""
+    hint = hint or {}
+    use_binding = binding or agent.binding
+    if use_binding == "mock":
+        return await mock_chat(agent.role, messages, hint, on_delta=on_delta)
+    provider, model = store.resolve_binding(use_binding)
+    return await real_chat(
+        provider,
+        model,
+        system,
+        messages,
+        effort=getattr(agent, "effort", "default") or "default",
+        proxy=store.settings.proxy,
+        on_delta=on_delta,
+    )
+
+
+def parse_json_tolerant(raw: str) -> dict | None:
+    """宽容解析 LLM 输出的 JSON：去代码围栏、截取首尾大括号。失败返回 None。"""
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    import json
+
+    try:
+        obj = json.loads(text[start : end + 1])
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
