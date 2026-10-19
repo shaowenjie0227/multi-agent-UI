@@ -62,8 +62,27 @@ async def run_task(
     await run.emit("task.started", {"title": title, "role": agent.role, "agentId": agent.id}, agentId=agent.id, taskId=task_id, round=round)
     await run.emit("agent.status", {"status": "working", "detail": title}, agentId=agent.id, taskId=task_id, round=round)
     on_delta, flush = delta_flusher(run, agent.id, task_id=task_id, round_no=round)
+
+    async def on_usage(payload: dict) -> None:
+        await run.emit(
+            "usage.reported",
+            {**payload, "taskTitle": title},
+            agentId=agent.id,
+            taskId=task_id,
+            round=round,
+        )
+
     try:
-        output = await chat_fn(run.store, agent, agent.persona, [{"role": "user", "content": user_content}], hint, binding, on_delta=on_delta)
+        output = await chat_fn(
+            run.store,
+            agent,
+            agent.persona,
+            [{"role": "user", "content": user_content}],
+            hint,
+            binding,
+            on_delta=on_delta,
+            on_usage=on_usage,
+        )
     except EngineError:
         await flush()
         await run.emit("agent.status", {"status": "error", "detail": "执行失败"}, agentId=agent.id, taskId=task_id, round=round)
@@ -79,14 +98,34 @@ async def run_task(
 
 
 async def execute_dag(tasks: list[dict], run_one: Callable[[dict, dict], Awaitable[Any]]) -> dict[str, Any]:
-    """按依赖拓扑调度；同一批无依赖任务并行。返回 {taskId: result}。"""
+    """按依赖拓扑调度；同一批无依赖任务并行。返回 {taskId: result}。
+
+    某个任务失败时，取消同批仍在跑的兄弟任务后整体上抛 —— 否则兄弟任务会在运行已判定失败
+    之后继续往事件流里写内容，历史回放会出现"失败之后还有产出"的错乱时序。
+    """
     done: dict[str, Any] = {}
     pending: dict[str, dict] = {t["id"]: t for t in tasks}
     while pending:
         ready = [t for t in pending.values() if all(d in done for d in t.get("dependsOn", []))]
         if not ready:
             raise EngineError("任务依赖形成环路，无法调度")
-        results = await asyncio.gather(*[run_one(t, {d: done[d] for d in t.get("dependsOn", [])}) for t in ready])
+        running = [asyncio.create_task(run_one(t, {d: done[d] for d in t.get("dependsOn", [])})) for t in ready]
+        try:
+            results = await asyncio.gather(*running)
+        except asyncio.CancelledError:
+            for task in running:
+                task.cancel()
+            await asyncio.gather(*running, return_exceptions=True)
+            raise
+        except Exception as e:
+            for task in running:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*running, return_exceptions=True)
+            failed = next((t for t in ready if t["id"] not in done), None)
+            if failed is not None:
+                raise EngineError(f"任务「{failed.get('title') or failed['id']}」执行失败：{e}") from e
+            raise
         for t, r in zip(ready, results):
             done[t["id"]] = r
             del pending[t["id"]]

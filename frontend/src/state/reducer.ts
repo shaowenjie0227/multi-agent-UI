@@ -1,5 +1,5 @@
 // 事件重放：RunState 由 RunEvent 流纯函数折叠而来，历史回放与实时推进共用同一逻辑
-import type { AgentCfg, Provider, ProviderModel, RunEvent, RunMeta, RunState } from '../types'
+import type { AgentCfg, Provider, ProviderModel, RunEvent, RunMeta, RunState, UsageRecord } from '../types'
 
 export interface AppState {
   providers: Provider[]
@@ -14,6 +14,7 @@ export type Action =
   | { type: 'config'; providers: Provider[]; models: ProviderModel[]; agents: AgentCfg[] }
   | { type: 'runs'; runs: RunMeta[] }
   | { type: 'openRun'; runId: string }
+  | { type: 'clearRun' }
   | { type: 'loadEvents'; runId: string; events: RunEvent[]; meta?: RunMeta }
   | { type: 'event'; event: RunEvent }
 
@@ -40,6 +41,7 @@ export function emptyRun(id: string, task = ''): RunState {
     finalResult: null,
     questions: [],
     packages: [],
+    planWarnings: [],
     assignmentOptions: [],
     assignments: [],
     tasks: {},
@@ -50,6 +52,7 @@ export function emptyRun(id: string, task = ''): RunState {
     verdicts: [],
     handoffs: [],
     userInputs: [],
+    usage: [],
   }
 }
 
@@ -69,7 +72,7 @@ function foldRun(rs: RunState, ev: RunEvent): RunState {
       next.status = 'completed'
       break
     case 'run.failed':
-      next.status = p.reason === 'stopped' ? 'stopped' : 'failed'
+      next.status = p.reason === 'stopped' ? 'stopped' : p.reason === 'interrupted' ? 'interrupted' : 'failed'
       next.errorMessage = p.message || ''
       break
     case 'phase.changed':
@@ -196,7 +199,26 @@ function foldRun(rs: RunState, ev: RunEvent): RunState {
     case 'review.verdict':
       next.verdicts = [
         ...next.verdicts.filter((v) => v.round !== p.round),
-        { round: p.round, passed: p.passed, report: p.report, failedItems: p.failedItems || [] },
+        { round: p.round, passed: p.passed, parsed: p.parsed !== false, report: p.report, failedItems: p.failedItems || [] },
+      ]
+      break
+    case 'plan.warning':
+      next.planWarnings = [...next.planWarnings, ...(p.warnings || [])]
+      break
+    case 'usage.reported':
+      next.usage = [
+        ...next.usage,
+        {
+          provider: p.provider,
+          model: p.model,
+          promptTokens: p.promptTokens || 0,
+          completionTokens: p.completionTokens || 0,
+          totalTokens: p.totalTokens || 0,
+          elapsedMs: p.elapsedMs || 0,
+          taskTitle: p.taskTitle,
+          agentId: ev.agentId,
+          ts: ev.ts,
+        } satisfies UsageRecord,
       ]
       break
     case 'result.final':
@@ -216,10 +238,22 @@ export function reducer(state: AppState, action: Action): AppState {
       return { ...state, runs: action.runs }
     case 'openRun':
       return { ...state, runId: action.runId }
+    case 'clearRun':
+      return { ...state, runId: null, run: null }
     case 'loadEvents': {
+      // 刷新/重连重放历史：task.completed 事件的 output 反填 liveByTask，
+      // 避免覆盖 WS 实时累积的流式缓冲（历史事件里没有 agent.output 增量）。
       let rs = emptyRun(action.runId)
       if (action.meta) rs.task = action.meta.task
-      for (const ev of action.events) rs = foldRun(rs, ev)
+      for (const ev of action.events) {
+        rs = foldRun(rs, ev)
+        if (ev.type === 'task.completed' && ev.taskId) {
+          const out = ev.payload?.output ?? ''
+          if (!rs.liveByTask[ev.taskId] || out.length > rs.liveByTask[ev.taskId].length) {
+            rs = { ...rs, liveByTask: { ...rs.liveByTask, [ev.taskId]: out } }
+          }
+        }
+      }
       return { ...state, runId: action.runId, run: rs }
     }
     case 'event': {

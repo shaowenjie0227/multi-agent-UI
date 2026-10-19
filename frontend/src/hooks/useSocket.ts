@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { getToken } from '../api'
 import type { RunEvent } from '../types'
 
 export function useSocket(onEvent: (ev: RunEvent) => void) {
@@ -13,7 +14,9 @@ export function useSocket(onEvent: (ev: RunEvent) => void) {
 
     const connect = () => {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-      ws = new WebSocket(`${proto}://${location.host}/ws`)
+      const token = getToken()
+      const qs = token ? `?token=${encodeURIComponent(token)}` : ''
+      ws = new WebSocket(`${proto}://${location.host}/ws${qs}`)
       ws.onopen = () => setConnected(true)
       ws.onmessage = (m) => {
         try {

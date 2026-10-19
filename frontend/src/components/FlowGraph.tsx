@@ -269,12 +269,19 @@ function FlowGraphInner({ run, agents, onOpenAgent }: { run: RunState | null; ag
     return { nodes, edges }
   }, [run, agents])
 
-  // 节点集合变化（含返工轮新节点）后自动适配视野
+  // 节点集合变化（含返工轮新节点）后自动适配视野。
+  // 用 requestAnimationFrame 等 React Flow 完成容器测量后再 fitView，否则加载历史运行时
+  // 容器尺寸还是 0，画布会卡在超大缩放。
   const nodeCount = nodes.length
   useEffect(() => {
-    if (nodeCount > 0) {
-      const t = setTimeout(() => rf.fitView({ padding: 0.25, duration: 400 }), 80)
-      return () => clearTimeout(t)
+    if (nodeCount === 0) return
+    let raf2 = 0
+    const raf1 = requestAnimationFrame(() => {
+      raf2 = requestAnimationFrame(() => rf.fitView({ padding: 0.25, duration: 300 }))
+    })
+    return () => {
+      cancelAnimationFrame(raf1)
+      cancelAnimationFrame(raf2)
     }
   }, [nodeCount, rf])
 

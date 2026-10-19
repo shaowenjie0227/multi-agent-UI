@@ -6,7 +6,7 @@ import time
 from typing import Any, Optional
 
 from ..schemas import RunEvent, RunMeta
-from ..store import Store, now, save_run
+from ..store import META_SNAPSHOT_EVERY, Store, append_run_event, now, save_run_meta
 
 
 class EventBus:
@@ -40,6 +40,8 @@ class Run:
         self.meta = RunMeta(id=run_id, task=task_text, status="running", createdAt=now())
         self.events: list[RunEvent] = []
         self.input_queue: asyncio.Queue = asyncio.Queue()
+        # 事件流是 JSONL 追加写；这里只在创建与终态写 meta（另有周期快照兜底）
+        save_run_meta(self.meta)
 
     async def emit(
         self,
@@ -61,7 +63,13 @@ class Run:
             payload=payload or {},
         )
         self.events.append(ev)
-        save_run(self.meta, self.events)
+        append_run_event(self.id, ev)
+
+        # 状态类事件立即刷新 meta（历史列表/重启收敛看到的是最新状态）；
+        # 其余高频事件只按周期补写，避免每事件都做一次完整序列化。
+        if type in ("run.started", "run.completed", "run.failed") or ev.seq % META_SNAPSHOT_EVERY == 0:
+            save_run_meta(self.meta)
+
         await self.bus.broadcast(ev)
         return ev
 

@@ -32,6 +32,8 @@ export default function App() {
   const [monitor, setMonitor] = useState<{ agentId: string; taskId?: string } | null>(null)
   const [errorMsg, setErrorMsg] = useState('')
   const resultShownFor = useRef<string | null>(null)
+  // 本次会话启动、正在跟踪的运行 id：只有它完成时才自动弹交付物
+  const watchedRun = useRef<string | null>(null)
 
   const run = state.run
 
@@ -82,14 +84,16 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connected])
 
-  // 运行结束后刷新历史列表；完成时自动弹出交付物
+  // 运行结束后刷新历史列表；只有"本次会话启动并跟踪的那次运行"完成时才自动弹交付物，
+  // 历史回放不打扰用户（旧逻辑用 resultShownFor 反向判断，导致打开历史运行就弹窗）。
   useEffect(() => {
     if (!run) return
     if (run.status !== 'running') refreshRuns()
-    if (run.status === 'completed' && run.finalResult && resultShownFor.current !== run.id) {
-      resultShownFor.current = run.id
+    if (run.status === 'completed' && run.finalResult && watchedRun.current === run.id) {
+      watchedRun.current = null
       setShowResult(true)
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [run?.status, run?.finalResult, run?.id])
 
   // 阶段切换时自动切右侧面板
@@ -106,6 +110,7 @@ export default function App() {
     try {
       const n = parseInt(agentCount, 10)
       const meta = await api.startRun(task.trim(), Number.isFinite(n) ? n : undefined)
+      watchedRun.current = meta.id
       dispatch({ type: 'openRun', runId: meta.id })
       await loadRunEvents(meta.id)
       refreshRuns()
@@ -143,8 +148,19 @@ export default function App() {
 
   const openHistory = async (id: string) => {
     setMonitor(null)
+    watchedRun.current = null // 历史运行不触发自动弹交付物
     await loadRunEvents(id)
     setShowResult(false)
+  }
+
+  const deleteRun = async (id: string) => {
+    try {
+      await api.deleteRun(id)
+      if (run?.id === id) dispatch({ type: 'clearRun' })
+      refreshRuns()
+    } catch (e: any) {
+      setErrorMsg(`删除运行失败：${e.message}`)
+    }
   }
 
   const showChat = sideTab === 'chat'
@@ -168,6 +184,7 @@ export default function App() {
         onOpenProviders={() => setShowProviders(true)}
         onOpenAgents={() => setShowAgents(true)}
         onOpenHistory={openHistory}
+        onDeleteRun={deleteRun}
         onOpenResult={() => setShowResult(true)}
       />
 
@@ -177,6 +194,23 @@ export default function App() {
           <button onClick={() => setErrorMsg('')} className="text-rose-400 hover:text-rose-200">
             ×
           </button>
+        </div>
+      )}
+
+      {/* 单运行限制：同一时间只能跑一个，先把原因说清楚 */}
+      {run?.status === 'running' && (
+        <div className="px-4 py-1 bg-slate-800/40 border-b border-slate-700/40 text-[11px] text-slate-500 shrink-0">
+          当前运行进行中，同一时间只支持一个运行；要开始新任务请先「停止」或等待本次完成。
+        </div>
+      )}
+
+      {/* 运行失败/中断的原因直接展示，不必去消息流里翻 */}
+      {run && (run.status === 'failed' || run.status === 'interrupted') && run.errorMessage && (
+        <div className="px-4 py-1.5 bg-rose-500/10 border-b border-rose-500/30 text-xs text-rose-300 flex items-center gap-2 shrink-0">
+          <span className="font-medium shrink-0">
+            {run.status === 'interrupted' ? '运行已中断' : '运行失败'}：
+          </span>
+          <span className="truncate">{run.errorMessage}</span>
         </div>
       )}
 

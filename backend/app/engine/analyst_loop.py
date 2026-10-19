@@ -10,8 +10,10 @@ from typing import Awaitable, Callable
 
 from ..providers.base import chat as chat_default
 from ..providers.base import parse_json_tolerant
+from .context import clip_history
 from .errors import EngineError
 from .executor import delta_flusher
+from .graph import sanitize_dependencies
 
 ChatFn = Callable[..., Awaitable[str]]
 
@@ -47,6 +49,16 @@ def _normalize_packages(raw) -> list[dict]:
                 "dependsOn": [str(d) for d in (p.get("dependsOn") or [])],
             }
         )
+    # 键去重：分析师偶尔会给出重复 key，会导致分配与返工按包归属错乱
+    seen: set[str] = set()
+    for i, p in enumerate(out, start=1):
+        key = p["key"]
+        if key in seen:
+            key = f"pkg-{i}"
+            while key in seen:
+                key += f"-{i}"
+            p["key"] = key
+        seen.add(key)
     return out
 
 
@@ -105,7 +117,7 @@ async def run_requirements_and_assignment(run, chat_fn: ChatFn = chat_default):
             )
             on_delta, flush = delta_flusher(run, analyst.id, task_id="req")
             raw = await chat_fn(
-                store, analyst, system, history,
+                store, analyst, system, clip_history(history),
                 {"analyst_turns": turns, "agent_count": getattr(run, "agent_count", None), "task": run.task_text},
                 on_delta=on_delta,
             )
@@ -117,6 +129,12 @@ async def run_requirements_and_assignment(run, chat_fn: ChatFn = chat_default):
             packages = _normalize_packages(parsed.get("work_packages"))
             ready = bool(parsed.get("ready_for_approval"))
             version += 1
+
+            # 依赖合法性在确认前就校验并修正，避免用户确认分配后才在执行期报"依赖成环"
+            if packages:
+                packages, warnings = sanitize_dependencies(packages)
+                if warnings:
+                    await run.emit("plan.warning", {"warnings": warnings, "version": version}, agentId=analyst.id, taskId="req")
 
             await run.emit(
                 "agent.status", {"status": "working", "detail": f"产出方案 v{version}"},

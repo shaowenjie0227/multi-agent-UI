@@ -112,6 +112,13 @@ export default function ChatPanel({ run, onSend, busy }: Props) {
               ))}
             </ul>
             <div className="text-[10px] text-slate-500 mt-2">确认方案后，你将在此为每个工作包分配 Agent 与模型。</div>
+            {run.planWarnings.length > 0 && (
+              <div className="mt-2 pt-2 border-t border-violet-500/20 text-[10px] text-amber-300/90 space-y-0.5">
+                {run.planWarnings.slice(-4).map((w, i) => (
+                  <div key={i}>⚠️ {w}</div>
+                ))}
+              </div>
+            )}
           </div>
         )}
 

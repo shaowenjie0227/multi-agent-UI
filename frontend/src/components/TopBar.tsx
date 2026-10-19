@@ -1,4 +1,4 @@
-import { Activity, Bot, History, Package, Play, Settings, Settings2, Sparkles, Square, Users, Wifi, WifiOff } from 'lucide-react'
+import { Activity, Bot, History, Package, Play, Settings, Settings2, Sparkles, Square, Trash2, Users, Wifi, WifiOff } from 'lucide-react'
 import { useState } from 'react'
 import type { RunMeta, RunState } from '../types'
 
@@ -19,6 +19,7 @@ interface Props {
   onOpenProviders: () => void
   onOpenAgents: () => void
   onOpenHistory: (id: string) => void
+  onDeleteRun: (id: string) => void
   onOpenResult: () => void
 }
 
@@ -27,6 +28,7 @@ const RUN_STATUS: Record<string, { label: string; cls: string }> = {
   completed: { label: '已完成', cls: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40' },
   failed: { label: '失败', cls: 'bg-rose-500/15 text-rose-300 border-rose-500/40' },
   stopped: { label: '已停止', cls: 'bg-slate-500/15 text-slate-300 border-slate-500/40' },
+  interrupted: { label: '已中断', cls: 'bg-slate-500/15 text-slate-300 border-slate-500/40' },
 }
 
 export default function TopBar(p: Props) {
@@ -139,34 +141,51 @@ export default function TopBar(p: Props) {
               <div className="absolute right-0 top-11 z-20 w-80 bg-[#101830] border border-slate-700 rounded-lg shadow-2xl overflow-hidden max-h-80 overflow-y-auto">
                 {p.runs.length === 0 && <div className="px-4 py-6 text-xs text-slate-500 text-center">暂无历史运行</div>}
                 {p.runs.map((r) => (
-                  <button
+                  <div
                     key={r.id}
-                    onClick={() => {
-                      setHistOpen(false)
-                      p.onOpenHistory(r.id)
-                    }}
-                    className={`w-full text-left px-3.5 py-2.5 hover:bg-slate-800/70 border-b border-slate-800/60 ${
+                    className={`group flex items-start gap-1 px-3.5 py-2.5 hover:bg-slate-800/70 border-b border-slate-800/60 ${
                       p.run?.id === r.id ? 'bg-slate-800/50' : ''
                     }`}
                   >
-                    <div className="flex items-center gap-2">
-                      <span
-                        className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                          r.status === 'running'
-                            ? 'bg-amber-400 blink'
-                            : r.status === 'completed'
-                              ? 'bg-emerald-400'
-                              : r.status === 'failed'
-                                ? 'bg-rose-500'
-                                : 'bg-slate-500'
-                        }`}
-                      />
-                      <span className="text-xs text-slate-200 truncate flex-1">{r.task}</span>
-                    </div>
-                    <div className="text-[10px] text-slate-500 mt-0.5">
-                      {new Date(r.createdAt * 1000).toLocaleString('zh-CN', { hour12: false })} · {r.id}
-                    </div>
-                  </button>
+                    <button
+                      onClick={() => {
+                        setHistOpen(false)
+                        p.onOpenHistory(r.id)
+                      }}
+                      className="flex-1 min-w-0 text-left"
+                    >
+                      <div className="flex items-center gap-2">
+                        <span
+                          className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                            r.status === 'running'
+                              ? 'bg-amber-400 blink'
+                              : r.status === 'completed'
+                                ? 'bg-emerald-400'
+                                : r.status === 'failed'
+                                  ? 'bg-rose-500'
+                                  : 'bg-slate-500'
+                          }`}
+                        />
+                        <span className="text-xs text-slate-200 truncate flex-1">{r.task}</span>
+                      </div>
+                      <div className="text-[10px] text-slate-500 mt-0.5">
+                        {new Date(r.createdAt * 1000).toLocaleString('zh-CN', { hour12: false })} ·{' '}
+                        {RUN_STATUS[r.status]?.label || r.status} · {r.id}
+                      </div>
+                    </button>
+                    {r.status !== 'running' && (
+                      <button
+                        title="删除该运行记录"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          if (window.confirm('删除这条运行记录？此操作不可恢复。')) p.onDeleteRun(r.id)
+                        }}
+                        className="p-1 rounded text-slate-600 opacity-0 group-hover:opacity-100 hover:text-rose-300 hover:bg-rose-500/10 shrink-0"
+                      >
+                        <Trash2 size={12} />
+                      </button>
+                    )}
+                  </div>
                 ))}
               </div>
             </>

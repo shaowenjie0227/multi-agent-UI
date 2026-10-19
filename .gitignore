@@ -1,4 +1,12 @@
 backend/.venv/
 backend/data/
 frontend/node_modules/
+frontend/dist/
 .DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.tsbuildinfo
+gui-test-screenshots/
+.zcode/
+llm selector/

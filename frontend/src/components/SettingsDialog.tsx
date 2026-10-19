@@ -1,6 +1,6 @@
-import { Gauge, Globe, Loader2, RefreshCw, Save, Wand2, Zap } from 'lucide-react'
+import { FolderOpen, Gauge, Globe, Loader2, Lock, RefreshCw, Save, Terminal, Wand2, Zap } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { api } from '../api'
+import { api, setToken } from '../api'
 import type { Provider } from '../types'
 import { Modal } from './ui'
 
@@ -34,6 +34,14 @@ export default function SettingsDialog({ onClose }: Props) {
     controllerUrl: 'http://127.0.0.1:9097',
     secret: '',
   })
+  const [workspaceEnabled, setWorkspaceEnabled] = useState(true)
+  const [authToken, setAuthToken] = useState('')
+  const [sandboxEnabled, setSandboxEnabled] = useState(true)
+  const [sandbox, setSandbox] = useState<{ enabled: boolean; timeoutSeconds: number; maxOutputChars: number }>({
+    enabled: true,
+    timeoutSeconds: 30,
+    maxOutputChars: 8000,
+  })
 
   const [subUrl, setSubUrl] = useState('')
   const [subNodes, setSubNodes] = useState<{ name: string; type: string }[]>([])
@@ -52,6 +60,12 @@ export default function SettingsDialog({ onClose }: Props) {
         const s = await api.settings()
         setProxy(s.proxy)
         setClash(s.clash)
+        if (s.workspace) setWorkspaceEnabled(!!s.workspace.enabled)
+        if (s.sandbox) {
+          setSandbox(s.sandbox)
+          setSandboxEnabled(!!s.sandbox.enabled)
+        }
+        if (s.auth) setAuthToken(s.auth.token || '')
       } catch {
         /* 使用默认值 */
       }
@@ -90,8 +104,7 @@ export default function SettingsDialog({ onClose }: Props) {
     }
   }
 
-  const fetchSub = async () => {
-    setBusy('sub')
+  const fetchSub = async () => {    setBusy('sub')
     setError('')
     setSubNodes([])
     try {
@@ -166,6 +179,151 @@ export default function SettingsDialog({ onClose }: Props) {
         </div>
       ) : (
         <div className="space-y-5">
+          {/* ---------- 访问令牌 ---------- */}
+          <section className="bg-[#0d1426] border border-slate-700/60 rounded-lg p-4 space-y-2">
+            <div className="flex items-center gap-2">
+              <Lock size={15} className="text-amber-300" />
+              <span className="text-sm font-medium text-slate-200">访问令牌</span>
+              <span className="text-[11px] text-slate-500">留空 = 不校验（仅本机使用）；填写后所有接口与实时连接都需携带</span>
+            </div>
+            <div className="flex gap-2">
+              <input
+                type="password"
+                value={authToken}
+                onChange={(e) => setAuthToken(e.target.value)}
+                placeholder="留空表示不启用鉴权"
+                className="flex-1 bg-[#141c33] border border-slate-700 rounded px-2.5 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-sky-500/60"
+              />
+              <button
+                onClick={async () => {
+                  setBusy('auth')
+                  setError('')
+                  try {
+                    await api.updateSettings({ auth: { token: authToken.trim() } })
+                    setToken(authToken.trim()) // 前端同步保存，后续请求自动带上
+                    flash(authToken.trim() ? '访问令牌已启用' : '访问令牌已清除（不再校验）')
+                  } catch (e: any) {
+                    setError(e.message)
+                  } finally {
+                    setBusy('')
+                  }
+                }}
+                disabled={busy === 'auth'}
+                className="flex items-center gap-1 px-3 py-1.5 rounded bg-sky-600 hover:bg-sky-500 text-white text-xs disabled:opacity-50"
+              >
+                <Save size={12} /> 保存
+              </button>
+            </div>
+          </section>
+
+          {/* ---------- 工作区 ---------- */}
+          <section className="bg-[#0d1426] border border-slate-700/60 rounded-lg p-4 space-y-2">
+            <div className="flex items-center gap-2">
+              <FolderOpen size={15} className="text-emerald-300" />
+              <span className="text-sm font-medium text-slate-200">交付文件落盘</span>
+              <span className="text-[11px] text-slate-500">
+                把工作包产出中带 <code className="text-slate-400">path=</code> 的代码块写入
+                backend/data/workspace/&lt;运行 id&gt;/
+              </span>
+            </div>
+            <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={workspaceEnabled}
+                onChange={async (e) => {
+                  const enabled = e.target.checked
+                  setWorkspaceEnabled(enabled)
+                  try {
+                    await api.updateSettings({ workspace: { enabled } })
+                    flash(enabled ? '已开启交付文件落盘' : '已关闭交付文件落盘')
+                  } catch (err: any) {
+                    setError(err.message)
+                    setWorkspaceEnabled(!enabled)
+                  }
+                }}
+                className="accent-emerald-500"
+              />
+              启用（关闭后 Agent 产出只作为文本报告，不写文件）
+            </label>
+          </section>
+
+          {/* ---------- 命令执行 ---------- */}
+          <section className="bg-[#0d1426] border border-slate-700/60 rounded-lg p-4 space-y-2">
+            <div className="flex items-center gap-2">
+              <Terminal size={15} className="text-sky-300" />
+              <span className="text-sm font-medium text-slate-200">命令执行（联调验收）</span>
+              <span className="text-[11px] text-slate-500">
+                测试工程师验收前在工作区跑测试；仅允许 python / node
+              </span>
+            </div>
+            <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={sandboxEnabled}
+                onChange={async (e) => {
+                  const enabled = e.target.checked
+                  setSandboxEnabled(enabled)
+                  try {
+                    await api.updateSettings({ sandbox: { ...sandbox, enabled } })
+                    flash(enabled ? '已开启命令执行' : '已关闭命令执行')
+                  } catch (err: any) {
+                    setError(err.message)
+                    setSandboxEnabled(!enabled)
+                  }
+                }}
+                className="accent-sky-500"
+              />
+              启用（关闭后测试工程师只看文档做验收）
+            </label>
+            <div className="flex items-center gap-3 text-[11px] text-slate-400">
+              <label className="flex items-center gap-1.5">
+                超时
+                <input
+                  type="number"
+                  min={1}
+                  max={120}
+                  value={sandbox.timeoutSeconds}
+                  onChange={(e) => setSandbox({ ...sandbox, timeoutSeconds: Number(e.target.value) })}
+                  className="w-16 bg-[#141c33] border border-slate-700 rounded px-1.5 py-0.5 text-slate-300"
+                />
+                秒
+              </label>
+              <label className="flex items-center gap-1.5">
+                输出上限
+                <input
+                  type="number"
+                  min={200}
+                  max={20000}
+                  step={500}
+                  value={sandbox.maxOutputChars}
+                  onChange={(e) => setSandbox({ ...sandbox, maxOutputChars: Number(e.target.value) })}
+                  className="w-20 bg-[#141c33] border border-slate-700 rounded px-1.5 py-0.5 text-slate-300"
+                />
+                字符
+              </label>
+              <button
+                onClick={async () => {
+                  setBusy('sandbox')
+                  try {
+                    await api.updateSettings({ sandbox })
+                    flash('命令执行参数已保存')
+                  } catch (err: any) {
+                    setError(err.message)
+                  } finally {
+                    setBusy('')
+                  }
+                }}
+                disabled={busy === 'sandbox'}
+                className="flex items-center gap-1 px-2 py-1 rounded bg-sky-600/80 hover:bg-sky-600 text-white disabled:opacity-50"
+              >
+                <Save size={11} /> 保存参数
+              </button>
+            </div>
+            <div className="text-[10px] text-amber-300/80 bg-amber-500/5 border border-amber-500/20 rounded px-2 py-1.5">
+              ⚠️ 不是强安全沙箱：白名单内的解释器仍能读写进程可及的文件。仅在本地开发使用，勿在多租户环境开启。
+            </div>
+          </section>
+
           {/* ---------- 代理设置 ---------- */}
           <section className="bg-[#0d1426] border border-slate-700/60 rounded-lg p-4 space-y-3">
             <div className="flex items-center gap-2">

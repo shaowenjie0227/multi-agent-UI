@@ -119,18 +119,54 @@ def _mock_work_package(hint: dict) -> str:
     tasks = hint.get("packageTasks") or []
     issues = hint.get("issues") or []
     head = "" if round_no <= 1 else "## 本轮修复点\n" + "".join(f"- 已修复：{i}\n" for i in issues) + "\n"
+    slug = _slug(name)
+    fix_note = "（返工修订）" if round_no > 1 else ""
+    # 交付真实文件块：让 Mock 模式也能演示"产出落盘到工作区"
+    files = (
+        f"## 交付文件\n\n"
+        f"```python path=src/{slug}/service.py\n"
+        f'"""{name} · 核心实现{fix_note}"""\n\n'
+        f"def handle(request):\n"
+        f"    \"\"\"{name} 主入口{fix_note}。\"\"\"\n"
+        f"    if not request:\n"
+        f"        raise ValueError(\"request 不能为空\")\n"
+        f"    return {{\"module\": \"{slug}\", \"round\": {round_no}, \"payload\": request}}\n"
+        f"```\n\n"
+        f"```markdown path=docs/{slug}.md\n"
+        f"# {name} 交付说明{fix_note}\n\n"
+        + "".join(f"- [x] {t}\n" for t in tasks) +
+        f"\n## 联调约定\n与上下游工作包按统一 JSON 结构对接。\n"
+        f"```"
+    )
     return (
         f"{head}"
         f"# {name} · 工作包结果报告（第 {round_no} 轮）\n\n"
         f"## 任务完成情况\n" + "".join(f"- [x] {t}\n" for t in tasks) + "\n"
         f"## 产出说明\n- 已按联调约定完成本工作包全部任务（Mock 演示输出）\n- 接口与数据结构已按约定对齐\n\n"
+        f"{files}\n\n"
         f"## 移交清单\n- 模块实现与说明文档\n- 联调对接说明"
     )
+
+
+def _slug(name: str) -> str:
+    """角色名 → 目录名（中文保留，去掉标点空格）。"""
+    import re
+
+    cleaned = re.sub(r"[^\w\u4e00-\u9fff-]", "", name or "pkg")
+    return cleaned or "pkg"
 
 
 def _mock_integration(hint: dict) -> str:
     round_no = hint.get("round", 1)
     packages = hint.get("packages") or []
+    # 真实工作区校验结果：让 Mock 也能反映机器执行这一客观依据
+    check_failures = hint.get("checkFailures") or []
+    check_block = ""
+    if check_failures:
+        check_block = "\n## 机器校验\n" + "".join(f"- ❌ {f}\n" for f in check_failures)
+    else:
+        check_block = "\n## 机器校验\n- ✅ 工作区命令全部通过（或未产生可执行文件）\n"
+
     if round_no <= 1 and packages:
         p1 = packages[0]
         p2 = packages[min(1, len(packages) - 1)]
@@ -140,14 +176,16 @@ def _mock_integration(hint: dict) -> str:
         ]
         rows = "\n".join(f"| {p} | 接口对接与异常约定 | {'❌' if p in (p1, p2) else '✅'} |" for p in packages)
         report = (
-            f"# 联调验收报告（第 1 轮）\n\n## 验收对照\n| 工作包 | 检查项 | 结果 |\n|---|---|---|\n{rows}\n\n"
+            f"# 联调验收报告（第 1 轮）\n\n## 验收对照\n| 工作包 | 检查项 | 结果 |\n|---|---|---|\n{rows}\n"
+            f"{check_block}\n"
             f"## 结论\n❌ 联调未通过，存在 {len(issues)} 个失败项，需按工作包返工。"
         )
     else:
         issues = []
         rows = "\n".join(f"| {p} | 接口对接与异常约定 | ✅ |" for p in packages)
         report = (
-            f"# 联调验收报告（第 {round_no} 轮 · 复测）\n\n## 验收对照\n| 工作包 | 检查项 | 结果 |\n|---|---|---|\n{rows}\n\n"
+            f"# 联调验收报告（第 {round_no} 轮 · 复测）\n\n## 验收对照\n| 工作包 | 检查项 | 结果 |\n|---|---|---|\n{rows}\n"
+            f"{check_block}\n"
             f"## 结论\n✅ 全部工作包对接通过，满足验收标准，建议进入交付。"
         )
     return json.dumps({"passed": not issues, "report": report, "failed_items": issues}, ensure_ascii=False)

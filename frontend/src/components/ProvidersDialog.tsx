@@ -128,7 +128,11 @@ export default function ProvidersDialog({ providers, models, onClose, onChanged 
                     type={showKey[p.id] ? 'text' : 'password'}
                     value={d.apiKey}
                     onChange={(e) => setDraft(p.id, { apiKey: e.target.value })}
-                    placeholder="API Key"
+                    onFocus={() => {
+                      // 后端只回传掩码：聚焦时清空，避免用户把掩码当作真实 Key 保存
+                      if (d.apiKey.includes('*')) setDraft(p.id, { apiKey: '' })
+                    }}
+                    placeholder={p.hasApiKey ? '已配置（留空表示不修改）' : 'API Key'}
                     className="w-full bg-[#141c33] border border-slate-700 rounded px-2.5 py-1.5 pr-8 text-xs text-slate-300 focus:outline-none focus:border-sky-500/60"
                   />
                   <button

@@ -32,6 +32,7 @@ export default function AgentPanel({ run, agents, providers, models, onOpenAgent
           >
             {latestVerdict.passed ? <CheckCircle2 size={12} /> : <AlertTriangle size={12} />}
             第 {latestVerdict.round} 轮测试：{latestVerdict.passed ? '通过' : '不通过'}
+            {latestVerdict.parsed === false && '（需人工复核）'}
           </span>
         )}
       </div>

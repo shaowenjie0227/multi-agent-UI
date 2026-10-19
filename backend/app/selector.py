@@ -259,7 +259,13 @@ async def recommend_llm(store, task: str, prefer: dict, models: list[dict]) -> O
         f"偏好：成本={'成本优先' if prefer.get('cost') == 'low' else '质量优先' if prefer.get('cost') == 'quality' else '均衡'}，"
         f"追求响应速度={'是' if prefer.get('speed') else '否'}"
     )
-    raw = await real_chat(provider, model, system, [{"role": "user", "content": user}])
+    raw = await real_chat(
+        provider,
+        model,
+        system,
+        [{"role": "user", "content": user}],
+        proxy=store.settings.proxy,
+    )
     return parse_json_tolerant(raw)
 
 

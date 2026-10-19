@@ -53,7 +53,7 @@ class RunEvent(BaseModel):
 class RunMeta(BaseModel):
     id: str
     task: str
-    status: str = "running"  # running | completed | failed | stopped
+    status: str = "running"  # running | completed | failed | stopped | interrupted
     createdAt: float = 0.0
     finishedAt: Optional[float] = None
 
@@ -123,14 +123,35 @@ class ClashSettings(BaseModel):
     secret: str = ""
 
 
+class WorkspaceSettings(BaseModel):
+    enabled: bool = True  # 把工作包产出中的 ```path=...``` 文件块真正写到工作区
+
+
+class SandboxSettings(BaseModel):
+    enabled: bool = True  # 允许在工作区执行白名单命令（python/node），用于跑测试
+    timeoutSeconds: int = 30
+    maxOutputChars: int = 8000
+
+
+class AuthSettings(BaseModel):
+    # 为空 = 不校验（仅本机使用）；设置后所有 /api 与 /ws 需带 token
+    token: str = ""
+
+
 class AppSettings(BaseModel):
     proxy: ProxySettings = Field(default_factory=ProxySettings)
     clash: ClashSettings = Field(default_factory=ClashSettings)
+    workspace: WorkspaceSettings = Field(default_factory=WorkspaceSettings)
+    sandbox: SandboxSettings = Field(default_factory=SandboxSettings)
+    auth: AuthSettings = Field(default_factory=AuthSettings)
 
 
 class SettingsUpdate(BaseModel):
     proxy: Optional[ProxySettings] = None
     clash: Optional[ClashSettings] = None
+    workspace: Optional[WorkspaceSettings] = None
+    sandbox: Optional[SandboxSettings] = None
+    auth: Optional[AuthSettings] = None
 
 
 class SubscriptionIn(BaseModel):

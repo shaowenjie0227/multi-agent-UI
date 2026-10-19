@@ -4,7 +4,8 @@ export interface Provider {
   id: string
   name: string
   baseUrl: string
-  apiKey: string
+  apiKey: string // 后端只回传掩码；保存时原样回传掩码表示不修改
+  hasApiKey?: boolean
   enabled: boolean
 }
 
@@ -30,7 +31,7 @@ export interface AgentCfg {
 export interface RunMeta {
   id: string
   task: string
-  status: 'running' | 'completed' | 'failed' | 'stopped'
+  status: 'running' | 'completed' | 'failed' | 'stopped' | 'interrupted'
   createdAt: number
   finishedAt?: number | null
 }
@@ -101,6 +102,7 @@ export interface Verdict {
   passed: boolean
   report: string
   failedItems: string[]
+  parsed?: boolean
 }
 
 export interface Handoff {
@@ -109,6 +111,18 @@ export interface Handoff {
   note: string
   failedItems: string[]
   kind: string
+}
+
+export interface UsageRecord {
+  provider?: string
+  model?: string
+  promptTokens: number
+  completionTokens: number
+  totalTokens: number
+  elapsedMs?: number
+  taskTitle?: string
+  agentId?: string | null
+  ts: number
 }
 
 export interface UserInput {
@@ -120,7 +134,7 @@ export interface UserInput {
 export interface RunState {
   id: string
   task: string
-  status: 'running' | 'completed' | 'failed' | 'stopped'
+  status: 'running' | 'completed' | 'failed' | 'stopped' | 'interrupted'
   phase: string
   seen: Set<number>
   events: RunEvent[]
@@ -130,6 +144,7 @@ export interface RunState {
   finalResult: string | null
   questions: string[]
   packages: WorkPackage[]
+  planWarnings: string[]
   assignmentOptions: AssignmentOption[]
   assignments: Assignment[]
   tasks: Record<string, TaskNode>
@@ -140,6 +155,7 @@ export interface RunState {
   verdicts: Verdict[]
   handoffs: Handoff[]
   userInputs: UserInput[]
+  usage: UsageRecord[]
   errorMessage?: string
 }
 

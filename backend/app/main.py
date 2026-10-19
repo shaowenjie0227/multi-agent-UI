@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from .clash import (
     extract_groups,
@@ -39,7 +41,20 @@ from .schemas import (
     SubscriptionIn,
 )
 from .selector import load_knowledge, recommend
-from .store import Store, load_run_events, load_run_metas, new_id, now
+from .store import (
+    DATA_DIR,
+    Store,
+    delete_run_file,
+    load_run_events,
+    load_run_meta,
+    load_run_metas,
+    new_id,
+    now,
+    reconcile_stale_runs,
+)
+from .workspace import Workspace
+
+WORKSPACE_DIR = DATA_DIR / "workspace"
 
 store = Store()
 bus = EventBus()
@@ -49,6 +64,8 @@ TASKS: dict[str, asyncio.Task] = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 上次进程退出时仍在跑的运行不可能继续推进，启动时收敛，避免历史列表永远显示"运行中"
+    reconcile_stale_runs()
     yield
 
 
@@ -60,33 +77,91 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+PUBLIC_PATHS = {"/api/settings"}  # 前端需要在拿到 token 前读取设置来判断是否已启用鉴权
+
+
+def _expected_token() -> str:
+    return (store.settings.auth.token or "").strip()
+
+
+def _token_ok(token: str) -> bool:
+    expected = _expected_token()
+    return not expected or hmac.compare_digest(token or "", expected)
+
+
+@app.middleware("http")
+async def auth_middleware(request, call_next):
+    """可选鉴权：settings.auth.token 为空时完全放行（默认本机使用）；
+    设置后要求 Authorization: Bearer <token>（或 ?token= / X-Auth-Token）。"""
+    if not _expected_token():
+        return await call_next(request)
+    path = request.url.path
+    if not path.startswith("/api") or path in PUBLIC_PATHS:
+        return await call_next(request)
+    token = ""
+    header = request.headers.get("authorization") or ""
+    if header.lower().startswith("bearer "):
+        token = header[7:].strip()
+    token = token or request.headers.get("x-auth-token", "") or request.query_params.get("token", "")
+    if not _token_ok(token):
+        return JSONResponse({"detail": "未授权：请在界面中填写访问令牌"}, status_code=401)
+    return await call_next(request)
+
+
+def _mask_key(key: str) -> str:
+    """API Key 只回传掩码，前端保存时若原样回传掩码则保留真实值（避免配置界面泄露明文）。"""
+    if not key:
+        return ""
+    if len(key) <= 8:
+        return "*" * len(key)
+    return f"{key[:4]}{'*' * (len(key) - 8)}{key[-4:]}"
+
+
+def _provider_out(p: Provider) -> dict:
+    return {**p.model_dump(), "apiKey": _mask_key(p.apiKey), "hasApiKey": bool(p.apiKey)}
+
+
+def _is_masked(value: str) -> bool:
+    return "*" in (value or "")
+
+
 
 # ---------------- 供应商 / 模型 ----------------
 
 
 @app.get("/api/providers")
 def get_providers():
-    return {"providers": store.providers, "models": store.models}
+    return {"providers": [_provider_out(p) for p in store.providers], "models": store.models}
 
 
 @app.post("/api/providers")
 def create_provider(body: ProviderIn):
     p = Provider(id=new_id("p_"), **body.model_dump())
-    return store.add_provider(p)
+    store.add_provider(p)
+    return _provider_out(p)
 
 
 @app.put("/api/providers/{pid}")
 def update_provider(pid: str, body: ProviderUpdate):
-    p = store.update_provider(pid, body.model_dump(exclude_unset=True))
+    patch = body.model_dump(exclude_unset=True)
+    # 前端拿到的是掩码；原样回传掩码视为"不修改密钥"
+    if "apiKey" in patch and _is_masked(patch["apiKey"] or ""):
+        patch.pop("apiKey")
+    p = store.update_provider(pid, patch)
     if not p:
         raise HTTPException(404, "供应商不存在")
-    return p
+    # 供应商配置变化后，旧的 OpenAI 客户端缓存（含连接池）已失效
+    from .providers.openai_compat import invalidate_client
+    invalidate_client(pid)
+    return _provider_out(p)
 
 
 @app.delete("/api/providers/{pid}")
 def delete_provider(pid: str):
     if not store.delete_provider(pid):
         raise HTTPException(404, "供应商不存在")
+    from .providers.openai_compat import invalidate_client
+    invalidate_client(pid)
     return {"ok": True}
 
 
@@ -117,8 +192,14 @@ async def fetch_models(pid: str):
         raise HTTPException(400, "请先填写该供应商的 Base URL")
     url = p.baseUrl.rstrip("/") + "/models"
     headers = {"Authorization": f"Bearer {p.apiKey}"} if p.apiKey else {}
+    proxy = store.settings.proxy
+    kwargs: dict = {"timeout": 15, "follow_redirects": True}
+    if proxy.mode == "custom":
+        kwargs.update(proxy=f"http://{proxy.host}:{proxy.port}", trust_env=False)
+    elif proxy.mode == "none":
+        kwargs["trust_env"] = False
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(**kwargs) as client:
             r = await client.get(url, headers=headers)
             r.raise_for_status()
             data = r.json()
@@ -168,8 +249,39 @@ def put_settings(body: SettingsUpdate):
     s = store.update_settings(
         proxy=body.proxy.model_dump() if body.proxy else None,
         clash=body.clash.model_dump() if body.clash else None,
+        workspace=body.workspace.model_dump() if body.workspace else None,
+        sandbox=body.sandbox.model_dump() if body.sandbox else None,
+        auth=body.auth.model_dump() if body.auth else None,
     )
+    if body.proxy:
+        # 代理设置变化后，所有缓存的 OpenAI 客户端底层 httpx 连接池都已失效
+        from .providers.openai_compat import invalidate_client
+        invalidate_client(None)
     return s
+
+
+# ---------------- 工作区文件（Agent 产出落盘） ----------------
+
+
+def _workspace_of(rid: str) -> Workspace:
+    if not load_run_meta(rid) and rid not in RUNS:
+        raise HTTPException(404, "运行不存在")
+    return Workspace(WORKSPACE_DIR / rid)
+
+
+@app.get("/api/runs/{rid}/artifacts")
+def list_artifacts(rid: str):
+    ws = _workspace_of(rid)
+    return {"enabled": store.settings.workspace.enabled, "root": str(ws.root), "files": ws.list_files()}
+
+
+@app.get("/api/runs/{rid}/artifacts/file")
+def read_artifact(rid: str, path: str):
+    ws = _workspace_of(rid)
+    try:
+        return ws.read(path)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @app.post("/api/clash/subscription")
@@ -310,8 +422,23 @@ def get_run(rid: str):
     events = load_run_events(rid)
     if events is None:
         raise HTTPException(404, "运行不存在")
-    meta = next((m for m in load_run_metas() if m.id == rid), None)
+    meta = load_run_meta(rid)
     return {"meta": meta, "events": events}
+
+
+@app.delete("/api/runs/{rid}")
+def delete_run(rid: str):
+    t = TASKS.get(rid)
+    if t and not t.done():
+        raise HTTPException(400, "运行仍在进行中，请先停止再删除")
+    TASKS.pop(rid, None)
+    RUNS.pop(rid, None)
+    if not delete_run_file(rid):
+        raise HTTPException(404, "运行不存在")
+    import shutil
+
+    shutil.rmtree(WORKSPACE_DIR / rid, ignore_errors=True)
+    return {"ok": True}
 
 
 @app.post("/api/runs/{rid}/input")
@@ -332,11 +459,41 @@ def stop_run(rid: str):
     return {"ok": True}
 
 
+@app.get("/api/runs/{rid}/usage")
+def run_usage(rid: str):
+    """按 Agent/模型汇总 token 用量，供交付物面板展示成本概况。"""
+    events = RUNS[rid].events if rid in RUNS else load_run_events(rid)
+    if events is None:
+        raise HTTPException(404, "运行不存在")
+    total = {"promptTokens": 0, "completionTokens": 0, "totalTokens": 0, "calls": 0, "elapsedMs": 0}
+    by_model: dict[str, dict] = {}
+    for ev in events:
+        if ev.type != "usage.reported":
+            continue
+        p = ev.payload or {}
+        total["calls"] += 1
+        for k in ("promptTokens", "completionTokens", "totalTokens", "elapsedMs"):
+            total[k] += int(p.get(k) or 0)
+        key = f"{p.get('provider') or '未知'} / {p.get('model') or '未知'}"
+        item = by_model.setdefault(
+            key, {"provider": p.get("provider"), "model": p.get("model"), "calls": 0,
+                  "promptTokens": 0, "completionTokens": 0, "totalTokens": 0, "elapsedMs": 0}
+        )
+        item["calls"] += 1
+        for k in ("promptTokens", "completionTokens", "totalTokens", "elapsedMs"):
+            item[k] += int(p.get(k) or 0)
+    return {"total": total, "byModel": sorted(by_model.values(), key=lambda x: x["totalTokens"], reverse=True)}
+
+
 # ---------------- WebSocket ----------------
 
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
+    # 可选鉴权：token 通过 ?token= 或 Sec-WebSocket-Protocol 传递
+    if not _token_ok(ws.query_params.get("token", "")):
+        await ws.close(code=1008)
+        return
     await ws.accept()
     q = bus.subscribe()
     try:
